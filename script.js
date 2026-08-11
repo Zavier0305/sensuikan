@@ -1,26 +1,17 @@
 'use strict';
 
 /* ============================================================
- * 海戦ゲーム（潜水艦）- 5x5 マス目の紙とペンで遊ぶ海戦ゲームを
- * 一台の端末でパス&プレイ（回し打ち）できるようにした実装。
+ * 海戦ゲーム（潜水艦）オンライン対戦版
+ * 5x5マスの海戦図を2〜5人で共有し、同じ種類・耐久1の船を
+ * 3隻ずつ秘密で配置して撃ち合う。移動なし・攻撃のみ。
+ * バックエンドは Supabase（DB / Realtime / RLS / RPC）。
  * ============================================================ */
 
 const COLS = ['A', 'B', 'C', 'D', 'E'];
 const ROWS = [1, 2, 3, 4, 5];
-
-const SHIP_DEFS = {
-  warship: { key: 'warship', symbol: 'W', name: '戦艦', maxHp: 3 },
-  destroyer: { key: 'destroyer', symbol: 'D', name: '駆逐艦', maxHp: 2 },
-  submarine: { key: 'submarine', symbol: 'S', name: '潜水艦', maxHp: 1 },
-};
-const SHIP_ORDER = ['warship', 'destroyer', 'submarine'];
-
-const DIRECTIONS = {
-  north: { label: '北 (row 1 方向)', dx: 0, dy: -1 },
-  south: { label: '南 (row 5 方向)', dx: 0, dy: 1 },
-  west: { label: '西 (A 方向)', dx: -1, dy: 0 },
-  east: { label: '東 (E 方向)', dx: 1, dy: 0 },
-};
+const SETTINGS_KEY = 'sensuikan_supabase_config';
+const NICKNAME_KEY = 'sensuikan_nickname';
+const ROOM_ID_KEY = 'sensuikan_room_id';
 
 function cellName(x, y) {
   return COLS[x] + ROWS[y];
@@ -32,69 +23,26 @@ function chebyshev(a, b) {
   return Math.max(Math.abs(a.x - b.x), Math.abs(a.y - b.y));
 }
 
-function createPlayer(name) {
-  const ships = {};
-  SHIP_ORDER.forEach((key) => {
-    const def = SHIP_DEFS[key];
-    ships[key] = { key, symbol: def.symbol, name: def.name, maxHp: def.maxHp, hp: def.maxHp, x: null, y: null, sunk: false };
-  });
-  return { name, ships };
-}
-
-function aliveShips(player) {
-  return SHIP_ORDER.map((k) => player.ships[k]).filter((s) => !s.sunk);
-}
-function allPlaced(player) {
-  return SHIP_ORDER.every((k) => player.ships[k].x !== null);
-}
-function shipAt(player, x, y) {
-  return aliveShips(player).find((s) => s.x === x && s.y === y) || null;
-}
-
 /* ------------------------- 状態 ------------------------- */
 
+let sb = null;
+
 const state = {
-  phase: 'title', // title | setup | handoff | turn | gameover
-  setupPlayerIndex: 0,
-  players: [createPlayer('プレイヤー1'), createPlayer('プレイヤー2')],
-  currentPlayerIndex: 0,
-  selectedShipForSetup: null,
-  actionMode: null, // null | 'attack' | 'move-select-ship' | 'move-select-dir' | 'move-select-dist'
-  moveShipKey: null,
-  moveDir: null,
-  handoffMessage: '',
-  handoffAction: null,
-  log: [],
-  winner: null,
+  view: 'boot', // boot | settings | title | lobby | game | gameover
+  userId: null,
+  roomId: null,
+  room: null,
+  players: [],
+  events: [],
+  myShips: [],
+  setupCells: [],
+  channel: null,
+  errorMessage: '',
+  busy: false,
   showRules: false,
+  pendingUrl: '',
+  pendingKey: '',
 };
-
-function resetGame() {
-  state.phase = 'title';
-  state.setupPlayerIndex = 0;
-  state.players = [createPlayer('プレイヤー1'), createPlayer('プレイヤー2')];
-  state.currentPlayerIndex = 0;
-  state.selectedShipForSetup = null;
-  state.actionMode = null;
-  state.moveShipKey = null;
-  state.moveDir = null;
-  state.handoffMessage = '';
-  state.handoffAction = null;
-  state.log = [];
-  state.winner = null;
-  render();
-}
-
-function addLog(text, cls) {
-  state.log.push({ text, cls: cls || '' });
-}
-
-function goToHandoff(message, action) {
-  state.handoffMessage = message;
-  state.handoffAction = action;
-  state.phase = 'handoff';
-  render();
-}
 
 /* ------------------------- DOM ヘルパ ------------------------- */
 
@@ -118,9 +66,153 @@ function el(tag, attrs, children) {
   return node;
 }
 
+function setError(msg) {
+  state.errorMessage = msg || '';
+  render();
+}
+
+/* ------------------------- 起動 / Supabase 初期化 ------------------------- */
+
+async function boot() {
+  const saved = localStorage.getItem(SETTINGS_KEY);
+  if (!saved) {
+    state.view = 'settings';
+    render();
+    return;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(saved);
+  } catch (e) {
+    state.view = 'settings';
+    render();
+    return;
+  }
+  await initSupabase(parsed.url, parsed.key, false);
+}
+
+async function initSupabase(url, key, persist) {
+  state.busy = true;
+  render();
+  try {
+    if (!window.supabase || !window.supabase.createClient) {
+      throw new Error('supabase-js の読み込みに失敗しました。ネットワーク接続を確認してください。');
+    }
+    sb = window.supabase.createClient(url, key);
+
+    let { data: sessionData } = await sb.auth.getSession();
+    let session = sessionData && sessionData.session;
+    if (!session) {
+      const { data, error } = await sb.auth.signInAnonymously();
+      if (error) throw error;
+      session = data.session;
+    }
+    if (!session) throw new Error('匿名ログインに失敗しました。Supabaseの Authentication > Providers で Anonymous Sign-Ins を有効にしてください。');
+
+    state.userId = session.user.id;
+    if (persist) localStorage.setItem(SETTINGS_KEY, JSON.stringify({ url, key }));
+
+    const savedRoomId = localStorage.getItem(ROOM_ID_KEY);
+    if (savedRoomId) {
+      state.roomId = savedRoomId;
+      subscribeRoom(savedRoomId);
+      await refreshRoomState();
+      if (!state.room) {
+        localStorage.removeItem(ROOM_ID_KEY);
+        state.roomId = null;
+        state.view = 'title';
+      }
+    } else {
+      state.view = 'title';
+    }
+    state.errorMessage = '';
+  } catch (e) {
+    state.view = 'settings';
+    state.errorMessage = '接続に失敗しました: ' + e.message;
+  }
+  state.busy = false;
+  render();
+}
+
+/* ------------------------- ルーム状態の取得 / 購読 ------------------------- */
+
+function subscribeRoom(roomId) {
+  if (state.channel) {
+    sb.removeChannel(state.channel);
+    state.channel = null;
+  }
+  state.channel = sb
+    .channel('room:' + roomId)
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'rooms', filter: `id=eq.${roomId}` }, refreshRoomState)
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'room_players', filter: `room_id=eq.${roomId}` }, refreshRoomState)
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'events', filter: `room_id=eq.${roomId}` }, refreshRoomState)
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'ships', filter: `room_id=eq.${roomId}` }, refreshRoomState)
+    .subscribe();
+}
+
+async function refreshRoomState() {
+  if (!state.roomId) return;
+  const [roomRes, playersRes, eventsRes, shipsRes] = await Promise.all([
+    sb.from('rooms').select('*').eq('id', state.roomId).maybeSingle(),
+    sb.from('room_players').select('*').eq('room_id', state.roomId).order('seat'),
+    sb.from('events').select('*').eq('room_id', state.roomId).order('created_at'),
+    sb.from('ships').select('*').eq('room_id', state.roomId).eq('owner_id', state.userId),
+  ]);
+
+  state.room = roomRes.data || null;
+  state.players = playersRes.data || [];
+  state.events = eventsRes.data || [];
+  state.myShips = shipsRes.data || [];
+
+  if (!state.room) {
+    state.view = 'title';
+  } else if (state.room.status === 'lobby') {
+    state.view = 'lobby';
+  } else if (state.room.status === 'playing') {
+    state.view = 'game';
+  } else if (state.room.status === 'finished') {
+    state.view = 'gameover';
+  }
+  render();
+}
+
+function nicknameOf(userId) {
+  const p = state.players.find((p) => p.user_id === userId);
+  return p ? p.nickname : '???';
+}
+
+function enterRoom(roomId) {
+  state.roomId = roomId;
+  localStorage.setItem(ROOM_ID_KEY, roomId);
+  subscribeRoom(roomId);
+  refreshRoomState();
+}
+
+function leaveRoomLocally() {
+  if (state.channel) {
+    sb.removeChannel(state.channel);
+    state.channel = null;
+  }
+  localStorage.removeItem(ROOM_ID_KEY);
+  state.roomId = null;
+  state.room = null;
+  state.players = [];
+  state.events = [];
+  state.myShips = [];
+  state.setupCells = [];
+  state.view = 'title';
+  render();
+}
+
+/* ------------------------- 画面描画 ------------------------- */
+
 function render() {
   app.innerHTML = '';
-  app.appendChild(el('h1', {}, ['🚢 海戦ゲーム（潜水艦）']));
+  app.appendChild(el('h1', {}, ['🚢 海戦ゲーム（潜水艦）オンライン']));
+
+  if (state.errorMessage) {
+    app.appendChild(el('div', { class: 'notice' }, [state.errorMessage]));
+  }
 
   const rulesBtn = el('div', { class: 'rules-toggle' }, [
     el('button', { class: 'btn secondary', onclick: () => { state.showRules = !state.showRules; render(); } },
@@ -129,191 +221,244 @@ function render() {
   app.appendChild(rulesBtn);
   if (state.showRules) app.appendChild(renderRules());
 
-  if (state.phase === 'title') app.appendChild(renderTitle());
-  else if (state.phase === 'setup') app.appendChild(renderSetup());
-  else if (state.phase === 'handoff') app.appendChild(renderHandoff());
-  else if (state.phase === 'turn') app.appendChild(renderTurn());
-  else if (state.phase === 'gameover') app.appendChild(renderGameOver());
+  if (state.view === 'boot') app.appendChild(el('div', { class: 'card center-text' }, ['読み込み中…']));
+  else if (state.view === 'settings') app.appendChild(renderSettings());
+  else if (state.view === 'title') app.appendChild(renderTitle());
+  else if (state.view === 'lobby') app.appendChild(renderLobby());
+  else if (state.view === 'game') app.appendChild(renderGame());
+  else if (state.view === 'gameover') app.appendChild(renderGameOver());
 
-  app.appendChild(el('footer', { class: 'credit' }, ['5×5 海戦図 / 1台の端末でパス&プレイ']));
+  app.appendChild(el('footer', { class: 'credit' }, ['5×5 共有海戦図 / 2〜5人オンライン対戦']));
 }
 
 function renderRules() {
   return el('div', { class: 'card' }, [
     el('p', { class: 'desc' }, [
-      '5×5マスの海戦図に、戦艦(W・耐久3)、駆逐艦(D・耐久2)、潜水艦(S・耐久1)を1隻ずつ配置します。' +
-      'ターンごとに「攻撃」か「移動」を選びます。攻撃は自分の艦に隣接する(斜め含む)マスにしか届きません。' +
-      '攻撃したマスに相手の艦が隣接していると、相手は「水しぶき」としてその艦の種類を申告します。' +
-      '移動は東西南北のいずれかに好きなマス数だけ、1隻だけ動かせます。相手の艦をすべて沈めたら勝利です。',
+      '全員で1枚の5×5海戦図を共有します。各プレイヤーは同じ種類・耐久1の船を3隻、他の人には秘密で配置します（他プレイヤーの船と同じマスに重なってもかまいません）。' +
+      '自分の番では、自分の船に隣接する（斜め含む）マスを1つ選んで攻撃します。そのマスに他プレイヤーの船があれば、そのマスにいる全員の船が同時に沈みます。' +
+      '攻撃したマスに自分の船が隣接していれば「水しぶき」として周囲に船があることが分かります。船をすべて沈められたプレイヤーは脱落し、最後まで残った1人の勝利です。',
     ]),
   ]);
 }
 
+/* ------------------------- 設定画面 ------------------------- */
+
+function renderSettings() {
+  return el('div', { class: 'card' }, [
+    el('h2', {}, ['Supabase 接続設定']),
+    el('p', { class: 'desc' }, [
+      'このゲームはオンライン対戦のため Supabase プロジェクトが必要です。README の手順でプロジェクトを作成し、' +
+      'SQL Editor で supabase/schema.sql を実行してから、Project Settings > API の URL と anon key をここに入力してください。' +
+      '入力内容はこの端末のブラウザにのみ保存されます。',
+    ]),
+    el('div', { class: 'form-row' }, [
+      el('label', {}, ['Project URL']),
+      el('input', { class: 'input', id: 'sb-url', type: 'text', placeholder: 'https://xxxxx.supabase.co', value: state.pendingUrl || '' }, []),
+    ]),
+    el('div', { class: 'form-row' }, [
+      el('label', {}, ['anon public key']),
+      el('input', { class: 'input', id: 'sb-key', type: 'text', placeholder: 'eyJhbGciOi...', value: state.pendingKey || '' }, []),
+    ]),
+    el('div', { class: 'btn-row' }, [
+      el('button', {
+        class: 'btn',
+        disabled: state.busy ? 'true' : null,
+        onclick: () => {
+          const url = document.getElementById('sb-url').value.trim();
+          const key = document.getElementById('sb-key').value.trim();
+          state.pendingUrl = url;
+          state.pendingKey = key;
+          if (!url || !key) { setError('URL と anon key の両方を入力してください'); return; }
+          initSupabase(url, key, true);
+        },
+      }, [state.busy ? '接続中…' : '接続する']),
+    ]),
+  ]);
+}
+
+/* ------------------------- タイトル画面 ------------------------- */
+
 function renderTitle() {
-  return el('div', { class: 'card center-text' }, [
-    el('p', { class: 'desc' }, ['2人で1台の端末を使って遊ぶパス&プレイ形式です。自分の番以外は画面を見ないでください。']),
-    el('button', { class: 'btn', onclick: () => { state.phase = 'setup'; state.setupPlayerIndex = 0; render(); } }, ['ゲームを始める']),
+  const savedNickname = localStorage.getItem(NICKNAME_KEY) || '';
+  return el('div', { class: 'card' }, [
+    el('div', { class: 'form-row' }, [
+      el('label', {}, ['ニックネーム']),
+      el('input', { class: 'input', id: 'nickname-input', type: 'text', value: savedNickname, maxlength: '16' }, []),
+    ]),
+    el('div', { class: 'btn-row' }, [
+      el('button', { class: 'btn', disabled: state.busy ? 'true' : null, onclick: createRoom }, ['ルームを作る']),
+    ]),
+    el('hr', {}, []),
+    el('div', { class: 'form-row' }, [
+      el('label', {}, ['ルームコード']),
+      el('input', { class: 'input', id: 'code-input', type: 'text', maxlength: '5', placeholder: '例: A1B2C' }, []),
+    ]),
+    el('div', { class: 'btn-row' }, [
+      el('button', { class: 'btn secondary', disabled: state.busy ? 'true' : null, onclick: joinRoom }, ['ルームに参加する']),
+    ]),
+    el('div', { class: 'btn-row' }, [
+      el('button', { class: 'btn secondary', onclick: () => { state.view = 'settings'; render(); } }, ['接続設定を変更']),
+    ]),
   ]);
 }
 
-/* ------------------------- セットアップ ------------------------- */
+function readNickname() {
+  const input = document.getElementById('nickname-input');
+  const nickname = input ? input.value.trim() : '';
+  if (nickname) localStorage.setItem(NICKNAME_KEY, nickname);
+  return nickname;
+}
 
-function renderSetup() {
-  const idx = state.setupPlayerIndex;
-  const player = state.players[idx];
+async function createRoom() {
+  const nickname = readNickname();
+  if (!nickname) { setError('ニックネームを入力してください'); return; }
+  state.busy = true;
+  setError('');
+  const { data, error } = await sb.rpc('create_room', { p_nickname: nickname });
+  state.busy = false;
+  if (error) { setError(error.message); return; }
+  const row = Array.isArray(data) ? data[0] : data;
+  enterRoom(row.room_id);
+}
+
+async function joinRoom() {
+  const nickname = readNickname();
+  const codeInput = document.getElementById('code-input');
+  const code = codeInput ? codeInput.value.trim() : '';
+  if (!nickname || !code) { setError('ニックネームとルームコードの両方を入力してください'); return; }
+  state.busy = true;
+  setError('');
+  const { data, error } = await sb.rpc('join_room_by_code', { p_code: code, p_nickname: nickname });
+  state.busy = false;
+  if (error) { setError(error.message); return; }
+  enterRoom(data);
+}
+
+/* ------------------------- ロビー画面 ------------------------- */
+
+function renderLobby() {
+  const room = state.room;
   const wrap = el('div', {}, []);
-  wrap.appendChild(el('h2', {}, [`${player.name} の艦艇配置`]));
-  wrap.appendChild(el('p', { class: 'desc' }, ['3隻すべてを異なるマスに配置してください。艦種を選んでからマスをタップします。']));
+  const me = state.players.find((p) => p.user_id === state.userId);
 
-  const palette = el('div', { class: 'ship-palette' }, SHIP_ORDER.map((key) => {
-    const ship = player.ships[key];
-    const selected = state.selectedShipForSetup === key;
-    return el('div', {
-      class: 'ship-btn' + (selected ? ' selected' : '') + (ship.x !== null ? ' placed' : ''),
-      onclick: () => { state.selectedShipForSetup = selected ? null : key; render(); },
-    }, [
-      `${ship.symbol} ${ship.name}`,
-      el('span', { class: 'small' }, [`耐久 ${ship.maxHp}${ship.x !== null ? ` (${cellName(ship.x, ship.y)})` : ''}`]),
-    ]);
-  }));
-  wrap.appendChild(palette);
+  wrap.appendChild(el('div', { class: 'card center-text' }, [
+    el('p', { class: 'desc' }, ['ルームコード（参加者に共有してください）']),
+    el('div', { class: 'room-code' }, [room.code]),
+  ]));
 
-  wrap.appendChild(el('div', { class: 'board-wrap' }, [renderBoardGrid({
-    onCellClick: (x, y) => {
-      const occupied = SHIP_ORDER.find((k) => {
-        const s = player.ships[k];
-        return s.x === x && s.y === y;
-      });
-      if (state.selectedShipForSetup) {
-        if (occupied && occupied !== state.selectedShipForSetup) return; // 他の自艦とは重複不可
-        player.ships[state.selectedShipForSetup].x = x;
-        player.ships[state.selectedShipForSetup].y = y;
-        render();
-      } else if (occupied) {
-        player.ships[occupied].x = null;
-        player.ships[occupied].y = null;
-        render();
-      }
-    },
-    cellClass: (x, y) => {
-      const occupied = SHIP_ORDER.find((k) => {
-        const s = player.ships[k];
-        return s.x === x && s.y === y;
-      });
-      return occupied ? 'clickable' : (state.selectedShipForSetup ? 'target' : '');
-    },
-    cellContent: (x, y) => {
-      const occupied = SHIP_ORDER.find((k) => {
-        const s = player.ships[k];
-        return s.x === x && s.y === y;
-      });
-      if (!occupied) return null;
-      return el('span', {}, [player.ships[occupied].symbol]);
-    },
-  })]));
+  wrap.appendChild(renderPlayerList());
 
-  if (allPlaced(player)) {
-    wrap.appendChild(el('div', { class: 'btn-row' }, [
-      el('button', { class: 'btn', onclick: () => finishSetup(idx) }, ['配置完了 →']),
-    ]));
+  if (!me || !me.ships_placed) {
+    wrap.appendChild(renderShipSetup());
   } else {
-    wrap.appendChild(el('p', { class: 'notice' }, ['あと ' + SHIP_ORDER.filter((k) => player.ships[k].x === null).length + ' 隻配置してください。']));
-  }
-  return wrap;
-}
-
-function finishSetup(idx) {
-  if (idx === 0) {
-    goToHandoff('プレイヤー2に交代してください。', () => {
-      state.setupPlayerIndex = 1;
-      state.selectedShipForSetup = null;
-      state.phase = 'setup';
-    });
-  } else {
-    goToHandoff('配置が完了しました。先手を決めます。', () => {
-      state.currentPlayerIndex = Math.random() < 0.5 ? 0 : 1;
-      addLog(`${state.players[state.currentPlayerIndex].name} が先手です。`, 'system');
-      state.selectedShipForSetup = null;
-      state.phase = 'turn';
-    });
-  }
-}
-
-/* ------------------------- ハンドオフ ------------------------- */
-
-function renderHandoff() {
-  return el('div', { class: 'card handoff' }, [
-    el('div', { class: 'icon' }, ['🙈']),
-    el('p', { class: 'desc' }, [state.handoffMessage]),
-    el('button', { class: 'btn', onclick: () => { state.handoffAction(); render(); } }, ['準備ができました（タップして表示）']),
-  ]);
-}
-
-/* ------------------------- 対戦ターン ------------------------- */
-
-function renderTurn() {
-  const cur = state.players[state.currentPlayerIndex];
-  const opp = state.players[1 - state.currentPlayerIndex];
-  const wrap = el('div', {}, []);
-
-  wrap.appendChild(el('div', { class: 'turn-banner' }, [`${cur.name} のターン`]));
-  wrap.appendChild(renderStatusRow(cur));
-
-  if (state.actionMode === null) {
-    wrap.appendChild(el('div', { class: 'board-wrap' }, [renderOwnBoard(cur)]));
-    wrap.appendChild(el('div', { class: 'btn-row' }, [
-      el('button', { class: 'btn', onclick: () => { state.actionMode = 'attack'; render(); } }, ['⚓ 攻撃']),
-      el('button', { class: 'btn secondary', onclick: () => { state.actionMode = 'move-select-ship'; render(); } }, ['➡ 移動']),
+    wrap.appendChild(el('div', { class: 'card center-text' }, [
+      el('p', { class: 'desc' }, ['配置が完了しました。他のプレイヤーを待っています…']),
     ]));
-  } else if (state.actionMode === 'attack') {
-    wrap.appendChild(renderAttackUI(cur, opp));
-  } else if (state.actionMode === 'move-select-ship') {
-    wrap.appendChild(renderMoveSelectShip(cur));
-  } else if (state.actionMode === 'move-select-dir') {
-    wrap.appendChild(renderMoveSelectDir(cur));
-  } else if (state.actionMode === 'move-select-dist') {
-    wrap.appendChild(renderMoveSelectDist(cur));
   }
+
+  const allPlaced = state.players.length > 0 && state.players.every((p) => p.ships_placed);
+  const isHost = room.host_id === state.userId;
+  if (isHost) {
+    const canStart = allPlaced && state.players.length >= 2 && state.players.length <= 5;
+    wrap.appendChild(el('div', { class: 'btn-row' }, [
+      el('button', {
+        class: 'btn',
+        disabled: canStart && !state.busy ? null : 'true',
+        onclick: startGame,
+      }, ['ゲーム開始（' + state.players.length + '人）']),
+    ]));
+    if (!canStart) {
+      wrap.appendChild(el('p', { class: 'notice' }, ['2〜5人が参加し、全員の配置が完了すると開始できます。']));
+    }
+  }
+
+  wrap.appendChild(el('div', { class: 'btn-row' }, [
+    el('button', { class: 'btn secondary', onclick: leaveRoomLocally }, ['ルームを離れる（この端末から表示を消す）']),
+  ]));
 
   wrap.appendChild(renderLog());
   return wrap;
 }
 
-function renderStatusRow(player) {
-  return el('div', { class: 'status-row' }, SHIP_ORDER.map((key) => {
-    const s = player.ships[key];
-    const dots = [];
-    for (let i = 0; i < s.maxHp; i++) {
-      dots.push(el('span', { class: 'dot' + (i < s.hp ? '' : ' lost') }, []));
-    }
-    return el('div', { class: 'status-chip' }, [
-      `${s.symbol} ${s.sunk ? '沈没' : ''}`,
-      el('div', { class: 'hp-dots' }, dots),
-    ]);
-  }));
+function renderPlayerList() {
+  return el('div', { class: 'card' }, [
+    el('h2', {}, ['参加者 (' + state.players.length + '/5)']),
+    el('div', { class: 'player-list' }, state.players.map((p) => el('div', { class: 'player-row' }, [
+      el('span', {}, [p.nickname + (p.user_id === state.userId ? '（あなた）' : '') + (p.user_id === state.room.host_id ? ' 👑' : '')]),
+      el('span', { class: 'small-tag' }, [p.ships_placed ? '配置済み' : '配置中…']),
+    ]))),
+  ]);
 }
 
-function renderOwnBoard(player) {
-  return renderBoardGrid({
-    onCellClick: null,
-    cellClass: () => '',
-    cellContent: (x, y) => {
-      const s = shipAt(player, x, y);
-      if (!s) return null;
-      return el('span', {}, [
-        s.symbol,
-        el('span', { class: 'hp' }, [`${s.hp}/${s.maxHp}`]),
-      ]);
+function renderShipSetup() {
+  const wrap = el('div', { class: 'card' }, [
+    el('h2', {}, ['艦艇配置']),
+    el('p', { class: 'desc' }, ['耐久1の船を3隻、共有の海戦図の好きなマスに配置してください（他プレイヤーの船とは重なってもかまいません）。マスをタップして選択・解除します。']),
+  ]);
+
+  wrap.appendChild(el('div', { class: 'board-wrap' }, [renderBoardGrid({
+    onCellClick: (x, y) => {
+      const idx = state.setupCells.findIndex((c) => c.x === x && c.y === y);
+      if (idx >= 0) {
+        state.setupCells.splice(idx, 1);
+      } else if (state.setupCells.length < 3) {
+        state.setupCells.push({ x, y });
+      }
+      render();
     },
-  });
+    cellClass: (x, y) => (state.setupCells.some((c) => c.x === x && c.y === y) ? 'target' : ''),
+    cellContent: (x, y) => (state.setupCells.some((c) => c.x === x && c.y === y) ? el('span', {}, ['⚓']) : null),
+  })]));
+
+  wrap.appendChild(el('p', { class: 'notice' }, [`${state.setupCells.length} / 3 隻 選択中`]));
+  wrap.appendChild(el('div', { class: 'btn-row' }, [
+    el('button', {
+      class: 'btn',
+      disabled: state.setupCells.length === 3 && !state.busy ? null : 'true',
+      onclick: submitShipSetup,
+    }, ['配置を確定する']),
+  ]));
+
+  return wrap;
 }
 
-function renderAttackUI(attacker, defender) {
-  const wrap = el('div', {}, []);
-  wrap.appendChild(el('p', { class: 'desc' }, ['自分の艦に隣接する(斜め含む)マスを1つ選んで攻撃します。']));
+async function submitShipSetup() {
+  if (state.setupCells.length !== 3) return;
+  state.busy = true;
+  setError('');
+  const cells = state.setupCells.map((c) => [c.x, c.y]);
+  const { error } = await sb.rpc('place_ships', { p_room_id: state.roomId, p_cells: cells });
+  state.busy = false;
+  if (error) { setError(error.message); render(); return; }
+  state.setupCells = [];
+  await refreshRoomState();
+}
 
+async function startGame() {
+  state.busy = true;
+  setError('');
+  const { error } = await sb.rpc('start_game', { p_room_id: state.roomId });
+  state.busy = false;
+  if (error) { setError(error.message); render(); return; }
+  await refreshRoomState();
+}
+
+/* ------------------------- 対戦画面 ------------------------- */
+
+function renderGame() {
+  const room = state.room;
+  const wrap = el('div', {}, []);
+  const myTurn = room.current_turn === state.userId;
+
+  wrap.appendChild(el('div', { class: 'turn-banner' }, [
+    myTurn ? 'あなたの番です' : `${nicknameOf(room.current_turn)} の番です`,
+  ]));
+
+  wrap.appendChild(renderPlayerStatusList());
+
+  const aliveShips = state.myShips.filter((s) => s.alive);
   const targets = new Set();
-  aliveShips(attacker).forEach((s) => {
+  aliveShips.forEach((s) => {
     for (let dx = -1; dx <= 1; dx++) {
       for (let dy = -1; dy <= 1; dy++) {
         if (dx === 0 && dy === 0) continue;
@@ -323,162 +468,78 @@ function renderAttackUI(attacker, defender) {
     }
   });
 
+  wrap.appendChild(el('p', { class: 'desc' }, ['盤面には自分の船だけが表示されます。緑色のマスは自分の船に隣接しており攻撃可能です。']));
+
   wrap.appendChild(el('div', { class: 'board-wrap' }, [renderBoardGrid({
-    onCellClick: (x, y) => {
-      if (!targets.has(x + ',' + y)) return;
-      resolveAttack(attacker, defender, x, y);
+    onCellClick: myTurn && !state.busy
+      ? (x, y) => {
+          if (!targets.has(x + ',' + y)) return;
+          doAttack(x, y);
+        }
+      : null,
+    cellClass: (x, y) => (myTurn && targets.has(x + ',' + y) ? 'target' : ''),
+    cellContent: (x, y) => {
+      const s = state.myShips.find((sh) => sh.x === x && sh.y === y);
+      if (!s) return null;
+      return el('span', { class: s.alive ? '' : 'sunk' }, [s.alive ? '⚓' : '×']);
     },
-    cellClass: (x, y) => (targets.has(x + ',' + y) ? 'target' : ''),
-    cellContent: () => null,
   })]));
 
-  wrap.appendChild(el('div', { class: 'btn-row' }, [
-    el('button', { class: 'btn secondary', onclick: () => { state.actionMode = null; render(); } }, ['← やめる']),
-  ]));
+  if (aliveShips.length === 0) {
+    wrap.appendChild(el('p', { class: 'notice' }, ['あなたの船はすべて沈没しました。ゲームの結果をお待ちください。']));
+  }
+
+  wrap.appendChild(renderLog());
   return wrap;
 }
 
-function resolveAttack(attacker, defender, x, y) {
-  const target = cellName(x, y);
-  const hitShip = shipAt(defender, x, y);
-  const splashes = aliveShips(defender).filter((s) => s !== hitShip && chebyshev(s, { x, y }) === 1);
+function renderPlayerStatusList() {
+  return el('div', { class: 'card' }, [
+    el('h2', {}, ['プレイヤー']),
+    el('div', { class: 'player-list' }, state.players.map((p) => el('div', { class: 'player-row' }, [
+      el('span', {}, [
+        p.nickname + (p.user_id === state.userId ? '（あなた）' : ''),
+        p.user_id === state.room.current_turn ? ' 🎯' : '',
+      ]),
+      el('span', { class: 'small-tag' + (p.eliminated ? ' danger-tag' : '') }, [p.eliminated ? '脱落' : '生存']),
+    ]))),
+  ]);
+}
 
-  if (hitShip) {
-    hitShip.hp -= 1;
-    if (hitShip.hp <= 0) {
-      hitShip.sunk = true;
-      addLog(`${attacker.name} が ${target} を攻撃 → 命中！ ${defender.name} の ${hitShip.name}(${hitShip.symbol}) を撃沈した！`, 'sunk');
-    } else {
-      addLog(`${attacker.name} が ${target} を攻撃 → 命中！（${defender.name} の艦、耐久残り ${hitShip.hp}）`, 'hit');
+async function doAttack(x, y) {
+  state.busy = true;
+  setError('');
+  const { error } = await sb.rpc('attack', { p_room_id: state.roomId, p_x: x, p_y: y });
+  state.busy = false;
+  if (error) { setError(error.message); render(); return; }
+  await refreshRoomState();
+}
+
+/* ------------------------- 交信記録 ------------------------- */
+
+function formatEvent(e) {
+  if (e.kind === 'attack') {
+    const target = cellName(e.x, e.y);
+    const hitNames = (e.hit_owner_ids || []).map(nicknameOf);
+    const splashNames = (e.splash_owner_ids || []).map(nicknameOf);
+    let text = `${nicknameOf(e.actor_id)} が ${target} を攻撃 → `;
+    text += hitNames.length ? `命中！ ${hitNames.join('、')} の船が沈没！` : '空振り。';
+    if (splashNames.length) {
+      text += ` （水しぶき: ${splashNames.join('、')} の船が近くにいます）`;
     }
-  } else {
-    addLog(`${attacker.name} が ${target} を攻撃 → 空振り。`, '');
+    return { text, cls: hitNames.length ? 'sunk' : '' };
   }
-
-  splashes.forEach((s) => {
-    addLog(`${defender.name} が水しぶきを申告：${target} の隣接マスに ${s.name}(${s.symbol}) がいる！`, 'hit');
-  });
-
-  state.actionMode = null;
-
-  if (aliveShips(defender).length === 0) {
-    state.winner = state.currentPlayerIndex;
-    state.phase = 'gameover';
-    render();
-    return;
-  }
-
-  const nextIndex = 1 - state.currentPlayerIndex;
-  goToHandoff(`${state.players[nextIndex].name} に交代してください。`, () => {
-    state.currentPlayerIndex = nextIndex;
-    state.phase = 'turn';
-  });
-}
-
-function renderMoveSelectShip(player) {
-  const wrap = el('div', {}, []);
-  wrap.appendChild(el('p', { class: 'desc' }, ['移動させる艦を選んでください。']));
-  wrap.appendChild(el('div', { class: 'board-wrap' }, [renderOwnBoard(player)]));
-  const options = aliveShips(player).map((s) => el('button', {
-    class: 'btn',
-    onclick: () => { state.moveShipKey = s.key; state.actionMode = 'move-select-dir'; render(); },
-  }, [`${s.symbol} ${s.name} (${cellName(s.x, s.y)})`]));
-  wrap.appendChild(el('div', { class: 'btn-row' }, options));
-  wrap.appendChild(el('div', { class: 'btn-row' }, [
-    el('button', { class: 'btn secondary', onclick: () => { state.actionMode = null; render(); } }, ['← やめる']),
-  ]));
-  return wrap;
-}
-
-function maxDistance(player, ship, dir) {
-  const d = DIRECTIONS[dir];
-  let dist = 0;
-  let x = ship.x, y = ship.y;
-  while (true) {
-    const nx = x + d.dx, ny = y + d.dy;
-    if (!inBounds(nx, ny)) break;
-    const blocker = SHIP_ORDER.some((k) => {
-      const other = player.ships[k];
-      return other.key !== ship.key && !other.sunk && other.x === nx && other.y === ny;
-    });
-    if (blocker) break;
-    dist += 1;
-    x = nx; y = ny;
-  }
-  return dist;
-}
-
-function renderMoveSelectDir(player) {
-  const ship = player.ships[state.moveShipKey];
-  const wrap = el('div', {}, []);
-  wrap.appendChild(el('p', { class: 'desc' }, [`${ship.symbol} ${ship.name} の移動方向を選んでください。(現在地: ${cellName(ship.x, ship.y)})`]));
-  wrap.appendChild(el('div', { class: 'board-wrap' }, [renderOwnBoard(player)]));
-
-  const buttons = Object.entries(DIRECTIONS).map(([key, d]) => {
-    const max = maxDistance(player, ship, key);
-    return el('button', {
-      class: 'btn' + (max === 0 ? ' secondary' : ''),
-      disabled: max === 0 ? 'true' : null,
-      onclick: () => { if (max === 0) return; state.moveDir = key; state.actionMode = 'move-select-dist'; render(); },
-    }, [`${d.label}（最大${max}マス）`]);
-  });
-  wrap.appendChild(el('div', { class: 'btn-row' }, buttons));
-  wrap.appendChild(el('div', { class: 'btn-row' }, [
-    el('button', { class: 'btn secondary', onclick: () => { state.actionMode = 'move-select-ship'; render(); } }, ['← 艦選択に戻る']),
-  ]));
-  return wrap;
-}
-
-function renderMoveSelectDist(player) {
-  const ship = player.ships[state.moveShipKey];
-  const max = maxDistance(player, ship, state.moveDir);
-  const wrap = el('div', {}, []);
-  wrap.appendChild(el('p', { class: 'desc' }, ['移動するマス数を選んでください。']));
-  wrap.appendChild(el('div', { class: 'board-wrap' }, [renderOwnBoard(player)]));
-
-  const distButtons = [];
-  for (let i = 1; i <= max; i++) {
-    distButtons.push(el('button', {
-      class: 'btn',
-      onclick: () => resolveMove(player, ship, state.moveDir, i),
-    }, [`${i} マス`]));
-  }
-  wrap.appendChild(el('div', { class: 'btn-row' }, distButtons));
-  wrap.appendChild(el('div', { class: 'btn-row' }, [
-    el('button', { class: 'btn secondary', onclick: () => { state.actionMode = 'move-select-dir'; render(); } }, ['← 方向選択に戻る']),
-  ]));
-  return wrap;
-}
-
-function resolveMove(player, ship, dir, dist) {
-  const d = DIRECTIONS[dir];
-  const nx = ship.x + d.dx * dist;
-  const ny = ship.y + d.dy * dist;
-  const from = cellName(ship.x, ship.y);
-  ship.x = nx;
-  ship.y = ny;
-  const to = cellName(nx, ny);
-
-  addLog(`${player.name}: ${ship.symbol} ${ship.name} を ${DIRECTIONS[dir].label} に ${dist} マス移動（${from} → ${to}）。`, 'move');
-
-  state.actionMode = null;
-  state.moveShipKey = null;
-  state.moveDir = null;
-
-  const nextIndex = 1 - state.currentPlayerIndex;
-  goToHandoff(`${state.players[nextIndex].name} に交代してください。`, () => {
-    state.currentPlayerIndex = nextIndex;
-    state.phase = 'turn';
-  });
+  return { text: e.message || '', cls: e.kind === 'gameover' ? 'sunk' : (e.kind === 'start' ? 'system' : '') };
 }
 
 function renderLog() {
   const box = el('div', { class: 'log' }, []);
-  if (state.log.length === 0) {
+  if (state.events.length === 0) {
     box.appendChild(el('div', { class: 'entry system' }, ['まだ行動はありません。']));
   } else {
-    state.log.slice().reverse().forEach((entry) => {
-      box.appendChild(el('div', { class: 'entry ' + entry.cls }, [entry.text]));
+    state.events.slice().reverse().forEach((e) => {
+      const f = formatEvent(e);
+      box.appendChild(el('div', { class: 'entry ' + f.cls }, [f.text]));
     });
   }
   return el('div', { class: 'card' }, [el('h2', {}, ['交信記録']), box]);
@@ -487,28 +548,15 @@ function renderLog() {
 /* ------------------------- ゲーム終了 ------------------------- */
 
 function renderGameOver() {
-  const winner = state.players[state.winner];
+  const room = state.room;
+  const winnerName = room.winner_id ? nicknameOf(room.winner_id) : '???';
   const wrap = el('div', { class: 'card center-text' }, [
-    el('h2', {}, [`🏆 ${winner.name} の勝利！`]),
-    el('p', { class: 'desc' }, ['両プレイヤーの海戦図を公開します。']),
+    el('h2', {}, [`🏆 ${winnerName} の勝利！`]),
   ]);
-
-  state.players.forEach((p) => {
-    wrap.appendChild(el('h2', {}, [p.name]));
-    wrap.appendChild(el('div', { class: 'board-wrap' }, [renderBoardGrid({
-      onCellClick: null,
-      cellClass: () => '',
-      cellContent: (x, y) => {
-        const s = SHIP_ORDER.map((k) => p.ships[k]).find((sh) => sh.x === x && sh.y === y);
-        if (!s) return null;
-        return el('span', {}, [s.symbol, el('span', { class: 'hp' }, [s.sunk ? '沈没' : `${s.hp}/${s.maxHp}`])]);
-      },
-    })]));
-  });
-
+  wrap.appendChild(renderPlayerStatusList());
   wrap.appendChild(renderLog());
   wrap.appendChild(el('div', { class: 'btn-row' }, [
-    el('button', { class: 'btn', onclick: resetGame }, ['もう一度あそぶ']),
+    el('button', { class: 'btn', onclick: leaveRoomLocally }, ['タイトルに戻る']),
   ]));
   return wrap;
 }
@@ -537,4 +585,4 @@ function renderBoardGrid({ onCellClick, cellClass, cellContent }) {
   return board;
 }
 
-render();
+boot();

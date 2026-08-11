@@ -183,38 +183,72 @@ p.desc {
   right: 4px;
 }
 
-.ship-palette {
+.form-row {
   display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-  margin: 8px 0 4px;
+  flex-direction: column;
+  gap: 4px;
+  margin: 10px 0;
+}
+.form-row label {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+.input {
+  background: #081521;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  color: var(--text);
+  font-size: 1rem;
+  width: 100%;
+}
+.input:focus {
+  outline: none;
+  border-color: var(--accent);
 }
 
-.ship-btn {
-  flex: 1 1 100px;
+hr {
+  border: none;
+  border-top: 1px solid var(--line);
+  margin: 16px 0;
+}
+
+.room-code {
+  font-size: 2.2rem;
+  font-weight: 900;
+  letter-spacing: 0.2em;
+  color: var(--accent-2);
+  margin: 8px 0;
+}
+
+.player-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.player-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
   background: var(--panel-2);
-  border: 2px solid var(--line);
-  border-radius: 10px;
-  padding: 10px 8px;
-  color: var(--text);
-  text-align: center;
-  cursor: pointer;
-  font-weight: 700;
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 0.9rem;
 }
-.ship-btn.selected {
-  border-color: var(--accent);
-  background: #1c3f57;
-}
-.ship-btn.placed::after {
-  content: " ✓";
-  color: var(--ok);
-}
-.ship-btn .small {
-  display: block;
-  font-weight: 400;
+.small-tag {
   font-size: 0.75rem;
-  color: var(--muted);
-  margin-top: 2px;
+  color: var(--ok);
+  background: #0e2a1d;
+  border-radius: 6px;
+  padding: 2px 8px;
+}
+.small-tag.danger-tag {
+  color: var(--danger);
+  background: #2a1414;
+}
+
+.cell span.sunk {
+  color: var(--danger);
 }
 
 .log {
@@ -246,40 +280,6 @@ p.desc {
   font-size: 1.05rem;
   font-weight: 700;
 }
-
-.handoff {
-  text-align: center;
-  padding: 48px 16px;
-}
-.handoff .icon {
-  font-size: 3rem;
-  margin-bottom: 12px;
-}
-
-.status-row {
-  display: flex;
-  justify-content: space-between;
-  gap: 8px;
-  margin: 6px 0 12px;
-}
-.status-chip {
-  flex: 1;
-  background: var(--panel-2);
-  border-radius: 8px;
-  padding: 6px 8px;
-  text-align: center;
-  font-size: 0.8rem;
-}
-.status-chip .hp-dots { margin-top: 2px; }
-.dot {
-  display: inline-block;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--ok);
-  margin: 0 1px;
-}
-.dot.lost { background: #33424c; }
 
 .notice {
   background: #2a2410;
