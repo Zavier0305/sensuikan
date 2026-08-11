@@ -13,6 +13,13 @@ const SETTINGS_KEY = 'sensuikan_supabase_config';
 const NICKNAME_KEY = 'sensuikan_nickname';
 const ROOM_ID_KEY = 'sensuikan_room_id';
 
+// このゲーム用に用意した Supabase プロジェクトの既定値。
+// publishable key はクライアント公開が前提の鍵で、実際の保護は
+// supabase/schema.sql の Row Level Security 側で行っている。
+// 別のプロジェクトを使いたい場合は「接続設定を変更」から上書きできる。
+const DEFAULT_SUPABASE_URL = 'https://ichvuncoiyffzjvbmswi.supabase.co';
+const DEFAULT_SUPABASE_KEY = 'sb_publishable_tsHY0-6akyn5O0OtTs1GkQ_SjLjuPt8';
+
 function cellName(x, y) {
   return COLS[x] + ROWS[y];
 }
@@ -75,20 +82,21 @@ function setError(msg) {
 
 async function boot() {
   const saved = localStorage.getItem(SETTINGS_KEY);
-  if (!saved) {
-    state.view = 'settings';
-    render();
+  if (saved) {
+    try {
+      const parsed = JSON.parse(saved);
+      await initSupabase(parsed.url, parsed.key, false);
+      return;
+    } catch (e) {
+      // 壊れた保存値は無視して既定値にフォールバックする
+    }
+  }
+  if (DEFAULT_SUPABASE_URL && DEFAULT_SUPABASE_KEY) {
+    await initSupabase(DEFAULT_SUPABASE_URL, DEFAULT_SUPABASE_KEY, false);
     return;
   }
-  let parsed;
-  try {
-    parsed = JSON.parse(saved);
-  } catch (e) {
-    state.view = 'settings';
-    render();
-    return;
-  }
-  await initSupabase(parsed.url, parsed.key, false);
+  state.view = 'settings';
+  render();
 }
 
 async function initSupabase(url, key, persist) {
@@ -247,17 +255,18 @@ function renderSettings() {
   return el('div', { class: 'card' }, [
     el('h2', {}, ['Supabase 接続設定']),
     el('p', { class: 'desc' }, [
-      'このゲームはオンライン対戦のため Supabase プロジェクトが必要です。README の手順でプロジェクトを作成し、' +
-      'SQL Editor で supabase/schema.sql を実行してから、Project Settings > API の URL と anon key をここに入力してください。' +
+      '通常は既定のプロジェクトに自動接続されるので、この画面を使う必要はありません。' +
+      '別の Supabase プロジェクトを使いたい場合のみ、README の手順でプロジェクトを作成し、' +
+      'SQL Editor で supabase/schema.sql を実行してから、Project Settings > API の URL と anon / publishable key をここに入力してください。' +
       '入力内容はこの端末のブラウザにのみ保存されます。',
     ]),
     el('div', { class: 'form-row' }, [
       el('label', {}, ['Project URL']),
-      el('input', { class: 'input', id: 'sb-url', type: 'text', placeholder: 'https://xxxxx.supabase.co', value: state.pendingUrl || '' }, []),
+      el('input', { class: 'input', id: 'sb-url', type: 'text', placeholder: 'https://xxxxx.supabase.co', value: state.pendingUrl || DEFAULT_SUPABASE_URL }, []),
     ]),
     el('div', { class: 'form-row' }, [
-      el('label', {}, ['anon public key']),
-      el('input', { class: 'input', id: 'sb-key', type: 'text', placeholder: 'eyJhbGciOi...', value: state.pendingKey || '' }, []),
+      el('label', {}, ['anon / publishable key']),
+      el('input', { class: 'input', id: 'sb-key', type: 'text', placeholder: 'eyJhbGciOi... または sb_publishable_...', value: state.pendingKey || DEFAULT_SUPABASE_KEY }, []),
     ]),
     el('div', { class: 'btn-row' }, [
       el('button', {
