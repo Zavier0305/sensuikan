@@ -431,12 +431,47 @@ begin
 end;
 $$;
 
+-- ホストがゲーム（ルーム）を強制終了する
+create or replace function public.end_game(p_room_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_host uuid;
+  v_status text;
+begin
+  if auth.uid() is null then
+    raise exception 'ログインしていません';
+  end if;
+
+  select host_id, status into v_host, v_status from rooms where id = p_room_id for update;
+  if v_host is null then
+    raise exception 'ルームが存在しません';
+  end if;
+  if auth.uid() <> v_host then
+    raise exception 'ホストだけがゲームを終了できます';
+  end if;
+  if v_status = 'finished' then
+    raise exception 'すでに終了しています';
+  end if;
+
+  update rooms set status = 'finished', winner_id = null, current_turn = null
+    where id = p_room_id;
+
+  insert into events (room_id, kind, actor_id, message)
+    values (p_room_id, 'gameover', auth.uid(), 'ホストがゲームを終了しました');
+end;
+$$;
+
 grant execute on function public.is_room_member(uuid) to authenticated;
 grant execute on function public.create_room(text) to authenticated;
 grant execute on function public.join_room_by_code(text, text) to authenticated;
 grant execute on function public.place_ships(uuid, jsonb) to authenticated;
 grant execute on function public.start_game(uuid) to authenticated;
 grant execute on function public.attack(uuid, int, int) to authenticated;
+grant execute on function public.end_game(uuid) to authenticated;
 
 -- ---------------------------------------------------------------------
 -- Realtime（変更をブラウザへプッシュ配信するために必要）
