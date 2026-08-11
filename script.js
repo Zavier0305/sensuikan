@@ -381,6 +381,12 @@ function renderLobby() {
     }
   }
 
+  if (isHost) {
+    wrap.appendChild(el('div', { class: 'btn-row' }, [
+      el('button', { class: 'btn danger', disabled: state.busy ? 'true' : null, onclick: endGame }, ['ゲームを終了する']),
+    ]));
+  }
+
   wrap.appendChild(el('div', { class: 'btn-row' }, [
     el('button', { class: 'btn secondary', onclick: leaveRoomLocally }, ['ルームを離れる（この端末から表示を消す）']),
   ]));
@@ -458,6 +464,7 @@ function renderGame() {
   const room = state.room;
   const wrap = el('div', {}, []);
   const myTurn = room.current_turn === state.userId;
+  const isHost = room.host_id === state.userId;
 
   wrap.appendChild(el('div', { class: 'turn-banner' }, [
     myTurn ? 'あなたの番です' : `${nicknameOf(room.current_turn)} の番です`,
@@ -489,6 +496,12 @@ function renderGame() {
     wrap.appendChild(el('p', { class: 'notice' }, ['あなたの船はすべて沈没しました。ゲームの結果をお待ちください。']));
   }
 
+  if (isHost) {
+    wrap.appendChild(el('div', { class: 'btn-row' }, [
+      el('button', { class: 'btn danger', disabled: state.busy ? 'true' : null, onclick: endGame }, ['ゲームを終了する']),
+    ]));
+  }
+
   wrap.appendChild(renderLog());
   return wrap;
 }
@@ -510,6 +523,16 @@ async function doAttack(x, y) {
   state.busy = true;
   setError('');
   const { error } = await sb.rpc('attack', { p_room_id: state.roomId, p_x: x, p_y: y });
+  state.busy = false;
+  if (error) { setError(error.message); render(); return; }
+  await refreshRoomState();
+}
+
+async function endGame() {
+  if (!window.confirm('ゲームを終了しますか？ 全員がゲーム終了画面に移ります。')) return;
+  state.busy = true;
+  setError('');
+  const { error } = await sb.rpc('end_game', { p_room_id: state.roomId });
   state.busy = false;
   if (error) { setError(error.message); render(); return; }
   await refreshRoomState();
@@ -549,9 +572,10 @@ function renderLog() {
 
 function renderGameOver() {
   const room = state.room;
-  const winnerName = room.winner_id ? nicknameOf(room.winner_id) : '???';
   const wrap = el('div', { class: 'card center-text' }, [
-    el('h2', {}, [`🏆 ${winnerName} の勝利！`]),
+    room.winner_id
+      ? el('h2', {}, [`🏆 ${nicknameOf(room.winner_id)} の勝利！`])
+      : el('h2', {}, ['🛑 ゲームはホストによって終了されました']),
   ]);
   wrap.appendChild(renderPlayerStatusList());
   wrap.appendChild(renderLog());
