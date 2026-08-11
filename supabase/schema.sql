@@ -319,7 +319,7 @@ begin
 end;
 $$;
 
--- 攻撃する（隣接判定・命中・水しぶき・全滅判定・手番送りをすべてここで行う）
+-- 攻撃する（命中・水しぶき・全滅判定・手番送りをすべてここで行う）
 create or replace function public.attack(p_room_id uuid, p_x int, p_y int)
 returns void
 language plpgsql
@@ -329,7 +329,6 @@ as $$
 declare
   v_room rooms%rowtype;
   v_my_seat int;
-  v_in_range boolean;
   v_hit_owners uuid[];
   v_splash_owners uuid[];
   v_owner record;
@@ -355,14 +354,12 @@ begin
     raise exception 'あなたの番ではありません';
   end if;
 
-  select exists (
+  if exists (
     select 1 from ships
     where room_id = p_room_id and owner_id = auth.uid() and alive
-      and greatest(abs(x - p_x), abs(y - p_y)) = 1
-  ) into v_in_range;
-
-  if not v_in_range then
-    raise exception '自分の艦に隣接する（斜め含む）マスにしか攻撃できません';
+      and x = p_x and y = p_y
+  ) then
+    raise exception '自分の艦がいるマスは攻撃できません';
   end if;
 
   -- 命中：このマスにいる、自分以外の生存艦をすべて撃沈する

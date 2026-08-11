@@ -243,7 +243,7 @@ function renderRules() {
   return el('div', { class: 'card' }, [
     el('p', { class: 'desc' }, [
       '全員で1枚の5×5海戦図を共有します。各プレイヤーは同じ種類・耐久1の船を3隻、他の人には秘密で配置します（他プレイヤーの船と同じマスに重なってもかまいません）。' +
-      '自分の番では、自分の船に隣接する（斜め含む）マスを1つ選んで攻撃します。そのマスに他プレイヤーの船があれば、そのマスにいる全員の船が同時に沈みます。' +
+      '自分の番では、自分の船があるマス以外ならどこでも1マス選んで攻撃できます。そのマスに他プレイヤーの船があれば、そのマスにいる全員の船が同時に沈みます。' +
       '攻撃したマスに自分の船が隣接していれば「水しぶき」として周囲に船があることが分かります。船をすべて沈められたプレイヤーは脱落し、最後まで残った1人の勝利です。',
     ]),
   ]);
@@ -466,27 +466,18 @@ function renderGame() {
   wrap.appendChild(renderPlayerStatusList());
 
   const aliveShips = state.myShips.filter((s) => s.alive);
-  const targets = new Set();
-  aliveShips.forEach((s) => {
-    for (let dx = -1; dx <= 1; dx++) {
-      for (let dy = -1; dy <= 1; dy++) {
-        if (dx === 0 && dy === 0) continue;
-        const nx = s.x + dx, ny = s.y + dy;
-        if (inBounds(nx, ny)) targets.add(nx + ',' + ny);
-      }
-    }
-  });
+  const ownCells = new Set(aliveShips.map((s) => s.x + ',' + s.y));
 
-  wrap.appendChild(el('p', { class: 'desc' }, ['盤面には自分の船だけが表示されます。緑色のマスは自分の船に隣接しており攻撃可能です。']));
+  wrap.appendChild(el('p', { class: 'desc' }, ['盤面には自分の船だけが表示されます。自分の船があるマス以外はどこでも攻撃できます。']));
 
   wrap.appendChild(el('div', { class: 'board-wrap' }, [renderBoardGrid({
     onCellClick: myTurn && !state.busy
       ? (x, y) => {
-          if (!targets.has(x + ',' + y)) return;
+          if (ownCells.has(x + ',' + y)) return;
           doAttack(x, y);
         }
       : null,
-    cellClass: (x, y) => (myTurn && targets.has(x + ',' + y) ? 'target' : ''),
+    cellClass: (x, y) => (myTurn && !ownCells.has(x + ',' + y) ? 'clickable' : ''),
     cellContent: (x, y) => {
       const s = state.myShips.find((sh) => sh.x === x && sh.y === y);
       if (!s) return null;
